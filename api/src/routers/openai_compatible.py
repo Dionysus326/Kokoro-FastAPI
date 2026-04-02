@@ -8,6 +8,8 @@ import tempfile
 from typing import AsyncGenerator, Dict, List, Tuple, Union
 from urllib import response
 
+from ..services.audio_cache import get_cached, put_cached, cleanup_cache
+
 import aiofiles
 import numpy as np
 import torch
@@ -190,9 +192,31 @@ async def create_speech(
         )
 
     try:
-        # model_name = get_model_name(request.model)
+        # Resolve voice name first so cache key uses canonical name
         tts_service = await get_tts_service()
         voice_name = await process_and_validate_voices(request.voice, tts_service)
+
+        # Check server-side persistent cache before doing any synthesis
+        cached_path = await get_cached(
+            text=request.input,
+            voice=voice_name,
+            model=request.model,
+            speed=request.speed,
+            fmt=request.response_format,
+        )
+        if cached_path:
+            content_type = {
+                "mp3": "audio/mpeg", "opus": "audio/opus", "aac": "audio/aac",
+                "flac": "audio/flac", "wav": "audio/wav", "pcm": "audio/pcm",
+            }.get(request.response_format, f"audio/{request.response_format}")
+            return FileResponse(
+                cached_path,
+                media_type=content_type,
+                headers={
+                    "Content-Disposition": f"attachment; filename=speech.{request.response_format}",
+                    "X-Cache": "HIT",
+                },
+            )
 
         # Set content type based on format
         content_type = {
@@ -268,11 +292,23 @@ async def create_speech(
                 )
 
             async def single_output():
+                collected = bytearray()
                 try:
-                    # Stream chunks
+                    # Stream chunks and collect for caching
                     async for chunk_data in generator:
                         if chunk_data.output:  # Skip empty chunks
+                            collected.extend(chunk_data.output)
                             yield chunk_data.output
+                    # Cache the complete audio after successful streaming
+                    if collected:
+                        try:
+                            await put_cached(
+                                text=request.input, voice=voice_name,
+                                model=request.model, speed=request.speed,
+                                fmt=request.response_format, data=bytes(collected),
+                            )
+                        except Exception as cache_err:
+                            logger.warning(f"Failed to cache audio: {cache_err}")
                 except Exception as e:
                     logger.error(f"Error in single output streaming: {e}")
                     writer.close()
@@ -322,6 +358,17 @@ async def create_speech(
                 is_last_chunk=True,
             )
             output = audio_data.output + final.output
+
+            # Cache the complete non-streaming audio
+            if output:
+                try:
+                    await put_cached(
+                        text=request.input, voice=voice_name,
+                        model=request.model, speed=request.speed,
+                        fmt=request.response_format, data=bytes(output),
+                    )
+                except Exception as cache_err:
+                    logger.warning(f"Failed to cache audio: {cache_err}")
 
             if request.return_download_link:
                 from ..services.temp_manager import TempFileWriter

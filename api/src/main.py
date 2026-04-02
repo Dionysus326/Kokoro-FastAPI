@@ -55,9 +55,12 @@ async def lifespan(app: FastAPI):
     from .inference.model_manager import get_manager
     from .inference.voice_manager import get_manager as get_voice_manager
     from .services.temp_manager import cleanup_temp_files
+    from .services.audio_cache import cleanup_cache
 
     # Clean old temp files on startup
     await cleanup_temp_files()
+    # Enforce cache size limits on startup
+    await cleanup_cache()
 
     logger.info("Loading TTS model and voice packs...")
 
